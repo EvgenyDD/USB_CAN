@@ -83,7 +83,7 @@ void main(void)
 	fw_header_check_all();
 
 	ret_mem_init();
-	ret_mem_set_load_src(LOAD_SRC_APP); // let preboot know it was booted from bootloader
+	ret_mem_set_load_src(LOAD_SRC_APP); // let preboot know it was booted from app
 
 	can_drv_init(CAN1);
 

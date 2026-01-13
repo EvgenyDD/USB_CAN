@@ -411,7 +411,6 @@ COMMON_WARN += -Wno-format-contains-nul
 COMMON_WARN += -Wno-format-extra-args
 COMMON_WARN += -Wno-int-in-bool-context
 COMMON_WARN += -Wno-int-to-pointer-cast
-COMMON_WARN += -Wno-mudflap
 COMMON_WARN += -Wno-multichar
 COMMON_WARN += -Wno-narrowing
 COMMON_WARN += -Wno-overflow

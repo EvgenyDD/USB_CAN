@@ -164,9 +164,11 @@ static const char *get_rst_src(void)
 
 const char *platform_reset_cause_get(void)
 {
-	const char *src = get_rst_src();
+	static const char *reset_src_str = NULL;
+	if(reset_src_str) return reset_src_str;
+	reset_src_str = get_rst_src();
 	RCC_ClearFlag();
-	return src;
+	return reset_src_str;
 }
 
 void platform_deinit(void)

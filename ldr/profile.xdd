@@ -1588,12 +1588,12 @@
           <q1:parameter uniqueID="UID_SUB_101801">
             <label lang="en">Vendor-ID</label>
             <UDINT />
-            <q1:defaultValue value="0x00525a4d" />
+            <q1:defaultValue value="0x53534F46" />
           </q1:parameter>
           <q1:parameter uniqueID="UID_SUB_101802">
             <label lang="en">Product code</label>
             <UDINT />
-            <q1:defaultValue value="0x00000180" />
+            <q1:defaultValue value="0x00004355" />
           </q1:parameter>
           <q1:parameter uniqueID="UID_SUB_101803">
             <label lang="en">Revision number</label>

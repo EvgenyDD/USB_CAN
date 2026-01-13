@@ -1,6 +1,7 @@
 #include "flasher_sdo.h"
 #include "CANopen.h"
 #include "OD.h"
+#include "config_system.h"
 #include "crc.h"
 #include "fw_header.h"
 #include "platform.h"
@@ -8,17 +9,20 @@
 /// CANopen Bootloader | Edition August 2008 | SYS TEC electronic GmbH 2008
 /// https://www.systec-electronic.com/fileadmin/Redakteur/Unternehmen/Support/Downloadbereich/Handbuecher/CANopen-BootloaderSoftware_Manual_L-1112e_05.pdf
 
+extern bool g_stay_in_boot;
+
 #if FW_TYPE == FW_LDR
 #define FW_TARGET FW_APP
-#define ADDR_ORIGIN ((uint32_t)&__app_start)
-#define ADDR_END ((uint32_t)&__app_end)
+#define ADDR_ORIGIN ((uint32_t) & __app_start)
+#define ADDR_END ((uint32_t) & __app_end)
 #elif FW_TYPE == FW_APP
 #define FW_TARGET FW_LDR
-#define ADDR_ORIGIN ((uint32_t)&__ldr_start)
-#define ADDR_END ((uint32_t)&__ldr_end)
+#define ADDR_ORIGIN ((uint32_t) & __ldr_start)
+#define ADDR_END ((uint32_t) & __ldr_end)
 #endif
 
-extern bool g_stay_in_boot;
+static uint8_t readout_data[CO_CONFIG_SDO_SRV_BUFFER_SIZE];
+static uint32_t readout_data_sz = 0;
 
 static ODR_t flash_cmd_cb(OD_stream_t *stream, const void *buf, OD_size_t count, OD_size_t *countWritten)
 {
@@ -71,7 +75,15 @@ static ODR_t flash_cmd_cb(OD_stream_t *stream, const void *buf, OD_size_t count,
 	   to start the bootloader (refer also to 3.2) */
 	case CO_SDO_FLASHER_W_START_BOOTLOADER:
 #if FW_TYPE == FW_LDR
-		OD_RAM.x1F57_flashStatusIdentification.error = CO_SDO_FLASHER_R_OK; // no operation in bootloader
+		fw_header_check_all();
+		if(g_fw_info[FW_APP].locked)
+		{
+			OD_RAM.x1F57_flashStatusIdentification.error = CO_SDO_FLASHER_R_NOVALPROG;
+		}
+		else
+		{
+			platform_reset();
+		}
 #else
 		fw_header_check_all();
 		if(g_fw_info[FW_LDR].locked)
@@ -90,31 +102,50 @@ static ODR_t flash_cmd_cb(OD_stream_t *stream, const void *buf, OD_size_t count,
 	return ODR_OK;
 }
 
-static ODR_t flash_data_cb(OD_stream_t *stream, const void *buf, OD_size_t count, OD_size_t *countWritten /* ignore */)
+static ODR_t flash_data_rd_cb(OD_stream_t *s, void *buf, OD_size_t count, OD_size_t *readed)
+{
+	if(s == NULL || buf == NULL || readed == NULL) return ODR_DEV_INCOMPAT;
+	OD_size_t read_len = readout_data_sz;
+	const uint8_t *d = readout_data;
+	ODR_t returnCode = ODR_OK;
+	if(s->dataOffset > 0 || read_len > count)
+	{
+		if(s->dataOffset >= read_len) return ODR_DEV_INCOMPAT;
+		read_len -= s->dataOffset;
+		d += s->dataOffset;
+		if(read_len > count)
+		{
+			read_len = count;
+			s->dataOffset += read_len;
+			returnCode = ODR_PARTIAL;
+		}
+		else
+		{
+			s->dataOffset = 0; /* copy finished, reset offset */
+		}
+	}
+	memcpy(buf, d, read_len);
+	*readed = read_len;
+	return returnCode;
+}
+
+static ODR_t flash_data_wr_cb(OD_stream_t *stream, const void *buf, OD_size_t count, OD_size_t *countWritten /* ignore */)
 {
 	g_stay_in_boot = true;
-
-	if(count < 16 + 1) return ODR_DATA_SHORT; // at least 1 block data byte
-
-#define BLCK_OFF_NUM (0U)
-#define BLCK_OFF_ADDR (4U)
-#define BLCK_OFF_SIZE (8U)
-
-	uint32_t block_num;
-	uint32_t block_address;
-	uint32_t block_size_data;
+	if(count < 16) return ODR_DATA_SHORT;
 	uint32_t block_crc;
-	memcpy(&block_num, &(((const uint8_t *)buf)[BLCK_OFF_NUM]), 4);
-	memcpy(&block_address, &(((const uint8_t *)buf)[BLCK_OFF_ADDR]), 4);
-	memcpy(&block_size_data, &(((const uint8_t *)buf)[BLCK_OFF_SIZE]), 4);
+	struct
+	{
+		uint32_t num;
+		uint32_t address;
+		uint32_t size_data;
+	} block;
+	memcpy(&block, buf, sizeof(block));
 
-#define BLCK_OFF_DATA (12U)
-#define BLCK_OFF_CRC (BLCK_OFF_DATA + block_size_data)
+	if(count != 16 + block.size_data) return ODR_TYPE_MISMATCH;
 
-	if(count != 16 + block_size_data) return ODR_TYPE_MISMATCH; // block layout error
-
-	memcpy((uint8_t *)&block_crc, &(((const uint8_t *)buf)[BLCK_OFF_CRC]), 4);
-	uint32_t crc_calc = crc32((const uint8_t *)buf, BLCK_OFF_CRC);
+	memcpy((uint8_t *)&block_crc, &(((const uint8_t *)buf)[sizeof(block) + block.size_data]), 4);
+	uint32_t crc_calc = crc32((const uint8_t *)buf, sizeof(block) + block.size_data);
 
 	OD_RAM.x1F56_appSoftIdentification.crc = crc_calc;
 
@@ -124,18 +155,48 @@ static ODR_t flash_data_cb(OD_stream_t *stream, const void *buf, OD_size_t count
 		return ODR_INVALID_VALUE;
 	}
 
-	uint32_t base_offset = (block_address > FLASH_SIZE) ? 0U		   // absolute addresation is used
+	if(block.size_data == 0) // read
+	{
+#define MAX_RD_SIZE CO_CONFIG_SDO_SRV_BUFFER_SIZE - 8
+		const uint8_t fw_sel = block.num;
+		const uint32_t offset = block.address;
+		readout_data[0] = fw_sel;
+		memcpy(&readout_data[1], &offset, 4);
+		uint32_t size_to_send = 0;
+		if(fw_sel == FW_APP + 1)
+		{
+			if(config_validate() == CONFIG_STS_OK)
+			{
+				size_to_send = config_get_size() - offset;
+				if(size_to_send > MAX_RD_SIZE - 5) size_to_send = MAX_RD_SIZE - 5;
+			}
+			memcpy(&readout_data[5], (uint8_t *)CFG_ORIGIN + offset, size_to_send);
+		}
+		else if(fw_sel < FW_COUNT)
+		{
+			if(g_fw_info[fw_sel].locked == 0 && offset < g_fw_info[fw_sel].size)
+			{
+				size_to_send = g_fw_info[fw_sel].size - offset;
+				if(size_to_send > MAX_RD_SIZE - 5) size_to_send = MAX_RD_SIZE - 5;
+			}
+			memcpy(&readout_data[5], (uint8_t *)g_fw_info[fw_sel].addr + offset, size_to_send);
+		}
+		readout_data_sz = 5 + size_to_send;
+		return ODR_OK;
+	}
+
+	uint32_t base_offset = (block.address > FLASH_SIZE) ? 0U		   // absolute addresation is used
 														: ADDR_ORIGIN; // relative addresation is used
 
 	// check that flashing type was not change enexpectedly and was not get out of the range
-	if(base_offset + block_address < ADDR_ORIGIN || base_offset + block_address + block_size_data > ADDR_END)
+	if(base_offset + block.address < ADDR_ORIGIN || base_offset + block.address + block.size_data > ADDR_END)
 	{
 		OD_RAM.x1F57_flashStatusIdentification.error = CO_SDO_FLASHER_R_SECURED;
 		return ODR_INVALID_VALUE;
 	}
 
-	if(block_num == 0) platform_flash_erase_flag_reset();
-	int sts_flash = platform_flash_write(base_offset + block_address, &(((const uint8_t *)buf)[BLCK_OFF_DATA]), block_size_data);
+	if(block.num == 0) platform_flash_erase_flag_reset();
+	int sts_flash = platform_flash_write(base_offset + block.address, &(((const uint8_t *)buf)[sizeof(block)]), block.size_data);
 	if(sts_flash)
 	{
 		OD_RAM.x1F57_flashStatusIdentification.error = CO_SDO_FLASHER_R_WRITE;
@@ -147,7 +208,7 @@ static ODR_t flash_data_cb(OD_stream_t *stream, const void *buf, OD_size_t count
 	return ODR_OK;
 }
 
-static OD_extension_t OD_1F50_extension = {.object = NULL, .read = OD_readOriginal, .write = flash_data_cb};
+static OD_extension_t OD_1F50_extension = {.object = NULL, .read = flash_data_rd_cb, .write = flash_data_wr_cb};
 static OD_extension_t OD_1F51_extension = {.object = NULL, .read = OD_readOriginal, .write = flash_cmd_cb};
 
 void flasher_sdo_init(void)
